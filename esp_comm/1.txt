@@ -1,0 +1,168 @@
+import os
+os.environ["UHD_LOG_LEVEL"] = "off"   # Disable USRP 'U' underrun messages
+
+import uhd
+import numpy as np
+import serial
+import time
+
+# Import LSTM module functions
+from lstm import (
+    parse_temperature,
+    normalize,
+    temps,
+    predict_future,
+    train_one_step,
+    WARMUP
+)
+
+# ============================================
+# CONFIGURATION
+# ============================================
+SERIAL_PORT = "/dev/ttyUSB0"
+BAUD_RATE = 115200
+
+TX_FREQ = 915e6
+TX_RATE = 1e6
+TX_GAIN = 80
+SAMPLES_PER_SYMBOL = 8
+
+
+# ============================================
+# MODULATION FUNCTIONS
+# ============================================
+def create_preamble():
+    """Create sync preamble for packet detection"""
+    barker = np.array([1, 1, 1, -1, -1, 1, -1, 1])
+    return np.tile(barker, 8)
+
+
+def bytes_to_iq_samples(data_bytes):
+    """Convert data bytes to IQ samples for transmission"""
+    preamble = b'\xAA\xAA\xAA\xAA'
+    length = len(data_bytes).to_bytes(2, "big")
+
+    packet = preamble + length + data_bytes
+    bits = np.unpackbits(np.frombuffer(packet, dtype=np.uint8))
+    symbols = 2 * bits.astype(float) - 1  # BPSK
+
+    sync_preamble = create_preamble()
+    symbols = np.concatenate([sync_preamble, symbols])
+
+    samples = np.repeat(symbols, SAMPLES_PER_SYMBOL)
+    return samples.astype(np.complex64)
+
+
+# ============================================
+# MAIN PROGRAM
+# ============================================
+def main():
+    print(f"Opening serial port {SERIAL_PORT} at {BAUD_RATE} baud...")
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+    print("Serial port opened successfully.")
+
+    # Setup USRP
+    print("\nInitializing USRP...")
+    usrp = uhd.usrp.MultiUSRP()
+    usrp.set_tx_rate(TX_RATE)
+    usrp.set_tx_freq(uhd.types.TuneRequest(TX_FREQ), 0)
+    usrp.set_tx_gain(TX_GAIN, 0)
+
+    stream_args = uhd.usrp.StreamArgs("fc32", "sc16")
+    streamer = usrp.get_tx_stream(stream_args)
+
+    print(f"USRP initialized:")
+    print(f"  Frequency: {usrp.get_tx_freq(0)/1e6} MHz")
+    print(f"  Sample Rate: {usrp.get_tx_rate(0)/1e6} MHz")
+    print(f"  Gain: {usrp.get_tx_gain(0)} dB\n")
+
+    print("Reading from ESP and transmitting...\n")
+
+    last_samples = np.zeros(1024, dtype=np.complex64)
+    sample_count = 0
+
+    try:
+        while True:
+
+            # --------------------------------------------------------
+            # READ SERIAL DATA
+            # --------------------------------------------------------
+            if ser.in_waiting > 0:
+                raw = ser.readline()
+
+                try:
+                    decoded = raw.decode("utf-8").strip()
+                except:
+                    decoded = ""
+
+                print(f"ESP Data: {decoded}")
+
+                # --------------------------------------------------------
+                # PARSE TEMPERATURE
+                # --------------------------------------------------------
+                real_temp = parse_temperature(decoded)
+                if real_temp is None:
+                    print("Could not parse temperature. Skipping.\n")
+                    continue
+
+                temps.append(normalize(real_temp))
+                sample_count += 1
+
+                # --------------------------------------------------------
+                # WARMUP (NEEDED FOR ACCURATE PREDICTION)
+                # --------------------------------------------------------
+                if sample_count < WARMUP:
+                    print(f"[WARMUP] collecting samples... {sample_count}/{WARMUP}\n")
+                    continue
+
+                # --------------------------------------------------------
+                # TRAIN LSTM (same as original code)
+                # --------------------------------------------------------
+                for _ in range(15):
+                    train_one_step()
+
+                # --------------------------------------------------------
+                # PREDICT
+                # --------------------------------------------------------
+                preds = predict_future()
+                predicted = preds[0] if preds else -999.0
+
+                print(f"Real: {real_temp:.3f}  Predicted: {predicted:.3f}")
+
+                # --------------------------------------------------------
+                # CREATE PACKET STRING
+                # --------------------------------------------------------
+                tx_string = f"REAL:{real_temp:.3f},PRED:{predicted:.3f}"
+                data_bytes = tx_string.encode("utf-8")
+
+                # Convert to IQ samples
+                last_samples = bytes_to_iq_samples(data_bytes)
+
+                print(f"TX: {tx_string}")
+                print(f"bytes: {len(data_bytes)} → samples: {len(last_samples)}\n")
+
+            # --------------------------------------------------------
+            # CONTINUOUS TX (Send larger buffer to avoid underruns)
+            # --------------------------------------------------------
+            md = uhd.types.TXMetadata()
+            md.has_time_spec = False
+
+            # Send 10× bigger buffer → avoids USRP underruns ('U')
+            streamer.send(np.tile(last_samples, 10), md)
+
+            time.sleep(0.0005)
+
+    except KeyboardInterrupt:
+        print("\nStopping transmission...")
+
+    finally:
+        md = uhd.types.TXMetadata()
+        md.end_of_burst = True
+        streamer.send(np.zeros(0, dtype=np.complex64), md)
+
+        ser.close()
+        print("Cleanup complete.\n")
+
+
+if __name__ == "__main__":
+    main()
